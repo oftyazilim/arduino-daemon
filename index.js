@@ -17,7 +17,7 @@ const {
   EVENT_FUNC_SCHEMA = "public",
   MACHINE_EVENTS_MANUAL_INCREMENT = "false",
   TIME_ZONE = "Europe/Istanbul",
-  SHIFT_SLICES = "08:00-18:00,16:00-00:00,22:00-06:00",
+  SHIFT_SLICES = "23:00-08:00, 08:00-18:00, 18:00-23:00",
   SHIFT_BREAK_CODE = "SHIFT",
   SHIFT_OEE_LOG = "true",
 } = process.env;
@@ -85,6 +85,7 @@ let dailyEnsureTimer = null; // gün değişiminde partition hazırlığı
 let partitionSchedulerStarted = false; // günlük scheduler tek sefer başlasın
 let initialPartitionEnsured = false; // açılışta bir defa ensure çalışsın
 let shiftTimers = []; // vardiya başlangıç timer'ları
+let shiftSlices = []; // {id,start,end,startMin,endMin}
 
 const WSTATION_ID = parseInt(ISTASYON_ID, 10) || 378;
 let eventFuncSchema = EVENT_FUNC_SCHEMA; // runtime'da otomatik güncellenecek
@@ -344,6 +345,28 @@ async function onData(line) {
             logger.error(`insert_machine_event çağrı hatası: ${e.message} | schema=${eventFuncSchema} args=[${typeof WSTATION_ID}, ${textStatus}, ${delta}, 0, ${machineCounter}, ${speedVal}]`);
             throw e;
           }
+          // insert sonrası shift_id güncelle
+          try {
+            const currentShiftId = getCurrentShiftId();
+            if (currentShiftId != null) {
+              const updSql = `WITH last_evt AS (
+                SELECT id FROM ${eventFuncSchema}.machine_events
+                WHERE wstation_id = $1::bigint
+                ORDER BY event_ts DESC NULLS LAST
+                LIMIT 1
+              )
+              UPDATE ${eventFuncSchema}.machine_events e
+              SET shift_id = $2::int
+              FROM last_evt
+              WHERE e.id = last_evt.id`;
+              const rUpd = await pool.query(updSql, [WSTATION_ID, currentShiftId]);
+              logger.info(`Event shift_id güncellendi (status change): shift_id=${currentShiftId}, rowCount=${rUpd.rowCount}`);
+            } else {
+              logger.warn('Geçerli vardiya bulunamadı (status change sonrası shift_id atanamadı)');
+            }
+          } catch (se) {
+            logger.error(`shift_id güncelleme hatası (status change): ${se.message}`);
+          }
         } catch (e) {
           logger.error(`work_order hareket kaydı hatası: ${e.message}`);
         }
@@ -352,7 +375,7 @@ async function onData(line) {
       // statu değiştiyse statu_time'ı da güncelle, değişmediyse dokunma
       if (statusChanged) {
         await pool.query(
-          "UPDATE oftt_works_info SET statu_id = $1, statu_time = NOW(), counter = counter + $2, speed = $3 WHERE wstation_id = $4",
+          "UPDATE oftt_works_info SET statu_id = $1, statu_time = NOW(), counter = counter + $2, speed = $3, break_description = '' WHERE wstation_id = $4",
           [durum, delta, speedVal, WSTATION_ID]
         );
       } else {
@@ -462,11 +485,66 @@ startPartitionSchedulerOnce();
 resolveInsertEventFuncSchema();
 
 // ---------------- VARDİYA PLANLAMA ----------------
+function toMinutes(hhmm) {
+  const [h, m] = hhmm.split(':').map(Number);
+  return h * 60 + m;
+}
+
 function parseShiftSlices(defStr) {
-  return defStr.split(/\s*,\s*/).map((seg) => {
-    const [start, end] = seg.split(/\s*-\s*/);
-    return { start, end };
-  }).filter(s => /\d{2}:\d{2}/.test(s.start) && /\d{2}:\d{2}/.test(s.end));
+  let id = 0;
+  return defStr
+    .split(/\s*,\s*/)
+    .map((seg) => {
+      const [start, end] = seg.split(/\s*-\s*/);
+      return { start, end };
+    })
+    .filter(
+      (s) => /\d{2}:\d{2}/.test(s.start) && /\d{2}:\d{2}/.test(s.end)
+    )
+    .map((s) => {
+      id += 1;
+      return {
+        id,
+        start: s.start,
+        end: s.end,
+        startMin: toMinutes(s.start),
+        endMin: toMinutes(s.end),
+      };
+    });
+}
+
+function nowInTZ() {
+  try {
+    const dtf = new Intl.DateTimeFormat('tr-TR', {
+      timeZone: TIME_ZONE,
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    });
+    const parts = dtf
+      .formatToParts(new Date())
+      .reduce((a, p) => ((a[p.type] = p.value), a), {});
+    return { h: parseInt(parts.hour, 10), m: parseInt(parts.minute, 10) };
+  } catch {
+    const d = new Date();
+    return { h: d.getUTCHours(), m: d.getUTCMinutes() };
+  }
+}
+
+function getCurrentShiftId() {
+  if (!shiftSlices.length) return null;
+  const { h, m } = nowInTZ();
+  const curMin = h * 60 + m;
+  for (const s of shiftSlices) {
+    // Normal dilim
+    if (s.endMin > s.startMin) {
+      if (curMin >= s.startMin && curMin < s.endMin) return s.id;
+    } else {
+      // Gece devreden (örn 23:00-08:00)
+      if (curMin >= s.startMin || curMin < s.endMin) return s.id;
+    }
+  }
+  return null;
 }
 
 function nextOccurrenceOf(timeHHMM) {
@@ -534,7 +612,24 @@ async function onShiftStart(slice) {
         speedVal,
         SHIFT_BREAK_CODE
       ]);
-      logger.info(`Vardiya başlangıcı event açıldı: ${slice.start}-${slice.end} status=${textStatus} counter=${totalCounter}`);
+      // insert sonrası ilgili olayın shift_id'sini set et
+      try {
+        const updSql = `WITH last_evt AS (
+          SELECT id FROM ${eventFuncSchema}.machine_events
+          WHERE wstation_id = $1::bigint
+          ORDER BY event_ts DESC NULLS LAST
+          LIMIT 1
+        )
+        UPDATE ${eventFuncSchema}.machine_events e
+        SET shift_id = $2::int
+        FROM last_evt
+        WHERE e.id = last_evt.id`;
+        const rUpd = await pool.query(updSql, [WSTATION_ID, slice.id]);
+        logger.info(`Vardiya başlangıcı event açıldı: ${slice.start}-${slice.end} status=${textStatus} counter=${totalCounter} -> shift_id=${slice.id}, rowCount=${rUpd.rowCount}`);
+      } catch (se) {
+        logger.error(`shift_id güncelleme hatası (shift start): ${se.message}`);
+        logger.info(`Vardiya başlangıcı event açıldı (shift_id atanamadı): ${slice.start}-${slice.end} status=${textStatus} counter=${totalCounter}`);
+      }
     }
   } catch (e) {
     logger.error(`Vardiya başlangıcı event hatası (${slice.start}-${slice.end}): ${e.message}`);
@@ -552,13 +647,13 @@ function scheduleShiftSlice(slice) {
 }
 
 function startShiftScheduler() {
-  const slices = parseShiftSlices(SHIFT_SLICES);
-  if (!slices.length) {
+  shiftSlices = parseShiftSlices(SHIFT_SLICES);
+  if (!shiftSlices.length) {
     logger.warn('SHIFT_SLICES boş veya geçersiz. Vardiya zamanlayıcı başlatılmadı.');
     return;
   }
-  slices.forEach(scheduleShiftSlice);
-  logger.info(`Toplam ${slices.length} vardiya başlangıcı zamanlandı.`);
+  shiftSlices.forEach(scheduleShiftSlice);
+  logger.info(`Toplam ${shiftSlices.length} vardiya başlangıcı zamanlandı (ID'ler 1..${shiftSlices.length}).`);
 }
 
 startShiftScheduler();
